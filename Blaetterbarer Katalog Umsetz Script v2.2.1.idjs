@@ -1,0 +1,1154 @@
+"use strict";
+
+/**
+ * Blaetterbarer Katalog Umsetz Script (UXP-Port)
+ * Version: v2.0.17b
+ * Datum: 2025-10-13
+ * Zweck: Exportiert Seiten- und Objektdaten aus InDesign für den blätterbaren Katalog.
+ * Hinweis: Du behältst die bestehende Ausgabespezifikation bytegenau bei (Dateiname, Format, Größe).
+ *
+ * Du verwendest UXP-APIs (indesign/uxp) und asynchrone I/O, ohne die fachliche Logik zu ändern.
+ * Kommentare sind rein funktional, JSDoc-Form, deutsch, Du-Form.
+ */
+
+// UXP-Module
+const { storage } = require("uxp");
+const { localFileSystem } = storage;
+const { app } = require("indesign");
+
+// Konfigurationen und Konstanten (unverändert zur Logik des Originals)
+const SKRIPT_NAME = "Blaetterbarer Katalog Umsetz Script";
+const SKRIPT_VERSION = "v2.0.17b";
+const SKRIPT_DATUM = "2025-10-13";
+const CUSTOMER = "personalshop";
+const KEEP_CSV_NAMES = false;
+
+const FALLBACK_SUCHPFAD = "X:/_Grafik 2024/10_Katalogseiten/"; // UXP: nur relevant, wenn der Benutzer diesen Root freigibt
+const FALLBACK_SUCHTIEFE = 3;
+
+const LOGGING_AKTIVIERT = true;
+const CSV_VERSION = "5";
+
+const EXPORT_MODE_DIRECT = "DIRECT";
+const EXPORT_MODE_CONVERT = "CONVERT";
+
+const FOUR_PAGE_SIDE_MAP = { RIGHT: 2, LEFT: 3 };
+
+const CSV_ZEILE_GRAPHIC = "G";
+const CSV_ZEILE_TEXT = "T";
+const CSV_ZEILE_PAGEITEM = "W";
+
+const MAX_REKURSIONS_TIEFE = 3;
+
+const STANDARD_EXPORT_GRAPHICS = true;
+const STANDARD_EXPORT_TEXTFRAMES = true;
+const STANDARD_EXPORT_TEXT_IN_STORIES = true;
+const STANDARD_EXPORT_TABLES = false;
+const STANDARD_EXPORT_PAGEITEMS = false;
+
+const REGEX_TABLE_IN_STORY = /\d{6}/;
+const REGEX_TEXTFRAME_IN_STORY = /(\d{2}[.])?\d{3}[.]\d{3}/;
+
+// Zeilenumbruch und BOM für bytegenaue Reproduktion
+const EOL = "\r\n"; // CRLF
+const UTF8_BOM = "\uFEFF"; // optionaler BOM-Präfix, nur verwenden, wenn Basis-Ausgabe BOM hatte
+const MIT_BOM = false; // setze auf true, falls die bestehende Referenzausgabe BOM verwendet
+
+/**
+ * Verkettet sichtbare Bounds entlang der Elternkette für Formen.
+ * @param {any} myParentObject - Elternobjekt
+ * @param {string} temp - Zeilenprefix
+ * @returns {string}
+ */
+function concatTempWithShapes(myParentObject, temp) {
+  let parentType = "" + myParentObject;
+  while (
+    parentType.indexOf("Polygon") > 0 ||
+    parentType.indexOf("Rectangle") > 0 ||
+    parentType.indexOf("Oval") > 0
+  ) {
+    temp = temp + "," + myParentObject.visibleBounds;
+    myParentObject = myParentObject.parent;
+    parentType = "" + myParentObject;
+  }
+  return temp;
+}
+
+/**
+ * Verkettet sichtbare Bounds entlang der Elternkette für beliebige PageItems.
+ * @param {any} myParentObject - Elternobjekt
+ * @param {string} temp - Zeilenprefix
+ * @returns {string}
+ */
+function concatTempWithPageItems(myParentObject, temp) {
+  let parentType = "" + myParentObject;
+  while (
+    parentType.indexOf("Polygon") > 0 ||
+    parentType.indexOf("Rectangle") > 0 ||
+    parentType.indexOf("Oval") > 0 ||
+    parentType.indexOf("group") > 0
+  ) {
+    temp = temp + "," + myParentObject.visibleBounds;
+    myParentObject = myParentObject.parent;
+    parentType = "" + myParentObject;
+  }
+  return temp;
+}
+
+/**
+ * Erzeugt ein Export-Item.
+ * @param {"DIRECT"|"CONVERT"} typ - Typ des Items
+ * @param {any} inddDatei - InDesign-Datei (File-Handle oder Pfad)
+ * @param {string|null} pdfName - Ursprünglicher PDF-Name
+ * @param {any} page - Seite im Hauptdokument
+ * @param {any} link - Verknüpfungsobjekt
+ * @returns {{typ:string, inddDatei:any, pdfName:string|null, page:any, link:any}}
+ */
+function erstelleExportItem(typ, inddDatei, pdfName, page, link) {
+  return { typ, inddDatei, pdfName: pdfName || null, page, link };
+}
+
+/**
+ * Erzeugt das CSV-Datenmodell.
+ * @param {any} inddDoc - Quelldokument
+ * @param {ReturnType<typeof erstelleExportItem>} sourceItem - Export-Item
+ * @param {string} zeilenDaten - CSV-Zeileninhalt
+ * @param {string} verwendeterLayer - Layername
+ * @returns {{quellIndd:string, quellPdf:string|null, elternSeite:number, header:string, zeilen:string, metadaten:any}}
+ */
+function erstelleCsvDataModel(inddDoc, sourceItem, zeilenDaten, verwendeterLayer) {
+  /**
+   * Baut den CSV-Header aus Dokumentparametern.
+   * @param {any} doc - Dokument
+   * @returns {string}
+   */
+  function erstelleCsvHeader(doc) {
+    const zeroPoint = doc.zeroPoint;
+    const pageWidth = doc.documentPreferences.pageWidth;
+    const pageHeight = doc.documentPreferences.pageHeight;
+    return `${zeroPoint},${pageWidth},${pageHeight},${CSV_VERSION}` + EOL;
+  }
+
+  const header = erstelleCsvHeader(inddDoc);
+  let zeilenAnzahl = 0;
+  if (zeilenDaten && zeilenDaten.length > 0) {
+    zeilenAnzahl = zeilenDaten.split(/\r?\n/).length;
+  }
+
+  return {
+    quellIndd: sourceItem.inddDatei && sourceItem.inddDatei.name ? sourceItem.inddDatei.name : "",
+    quellPdf: sourceItem.pdfName || null,
+    elternSeite: sourceItem.page ? parseInt(sourceItem.page.name, 10) : -1,
+    header,
+    zeilen: zeilenDaten,
+    metadaten: {
+      verarbeitetAm: new Date(),
+      zeilenAnzahl,
+      dokumentName: inddDoc.name,
+      verwendeterLayer: verwendeterLayer || "unbekannt",
+    },
+  };
+}
+
+/**
+ * String-Werkzeuge.
+ * @constructor
+ */
+function StringUtils() {
+  /**
+   * Entfernt die Dateierweiterung.
+   * @param {string} dateiName - Dateiname
+   * @returns {string}
+   */
+  this.entferneExtension = function (dateiName) {
+    if (!dateiName) return "";
+    const letzterpunkt = dateiName.lastIndexOf(".");
+    if (letzterpunkt === -1) return dateiName;
+    return dateiName.substring(0, letzterpunkt);
+  };
+}
+
+/**
+ * Zeit-/Datums-Werkzeuge.
+ * @constructor
+ */
+function DateUtils() {
+  /**
+   * Formatiert Sekunden als HH:MM:SS.
+   * @param {number} sekunden - Sekundenwert
+   * @returns {string}
+   */
+  this.formatiereZeit = function (sekunden) {
+    const h = Math.floor(sekunden / 3600);
+    const m = Math.floor((sekunden % 3600) / 60);
+    const s = Math.floor(sekunden % 60);
+    const pad = (num) => (num < 10 ? "0" : "") + num;
+    return `${pad(h)}:${pad(m)}:${pad(s)}`;
+  };
+}
+
+/**
+ * Fehlerbehandlung.
+ * @constructor
+ */
+function ErrorHandler() {
+  /**
+   * Formatiert einen Fehlertext.
+   * @param {any} fehlerObj - Fehlerobjekt
+   * @param {string} dateiInfo - Kontext
+   * @returns {string}
+   */
+  this.formatiereFehler = function (fehlerObj, dateiInfo) {
+    const basisNachricht = fehlerObj && fehlerObj.message ? fehlerObj.message : "Unbekannter Fehler.";
+    let zusatz = "";
+    if (fehlerObj && fehlerObj.line) {
+      zusatz += ` (Zeile: ${fehlerObj.line})`;
+    }
+    return basisNachricht + zusatz;
+  };
+
+  /**
+   * Fügt einen Fehler zur Liste hinzu.
+   * @param {any} fehler - Fehlerobjekt
+   * @param {string} kontext - Kontext
+   * @param {Array} fehlerListe - Sammlung
+   */
+  this.sammleFehler = function (fehler, kontext, fehlerListe) {
+    const fehlerMsg = this.formatiereFehler(fehler, kontext);
+    fehlerListe.push({ betroffeneDatei: kontext, grund: fehlerMsg });
+  };
+
+  /**
+   * Erstellt einen textuellen Fehlerreport.
+   * @param {Array} fehlerListe - Sammlung
+   * @returns {string}
+   */
+  this.erstelleFehlerReport = function (fehlerListe) {
+    if (!fehlerListe || fehlerListe.length === 0) return "";
+    let report = "Bei den folgenden Dateien ist ein Problem aufgetreten:" + EOL + EOL;
+    for (let i = 0; i < fehlerListe.length; i++) {
+      report += `- ${fehlerListe[i].betroffeneDatei}` + EOL;
+      report += `  Grund: ${fehlerListe[i].grund}` + EOL + EOL;
+    }
+    return report;
+  };
+}
+
+/**
+ * Logger mit dateibasierter Ausgabe.
+ * @constructor
+ */
+function Logger() {
+  this.logFile = null;
+  this.aktiviert = false;
+
+  /**
+   * Initialisiert den Logger mit einem Zieldatei-Handle.
+   * @param {any} fileHandle - UXP File-Handle
+   * @param {boolean} aktiviert - Aktivschalter
+   */
+  this.initialisiere = function (fileHandle, aktiviert) {
+    this.logFile = fileHandle || null;
+    this.aktiviert = !!aktiviert;
+  };
+
+  /**
+   * Schreibt eine Infozeile.
+   * @param {string} nachricht - Text
+   */
+  this.log = async function (nachricht) {
+    await this._schreibeEintrag("[INFO] " + nachricht);
+  };
+
+  /**
+   * Schreibt einen Fehler.
+   * @param {string} fehler - Text
+   * @param {string} kontext - Kontext
+   */
+  this.logFehler = async function (fehler, kontext) {
+    await this._schreibeEintrag("[ERROR] " + (kontext ? kontext + ": " : "") + fehler);
+  };
+
+  /**
+   * Schreibt eine Warnung.
+   * @param {string} nachricht - Text
+   */
+  this.logWarnung = async function (nachricht) {
+    await this._schreibeEintrag("[WARN] " + nachricht);
+  };
+
+  /**
+   * Schreibt eine Zeile in die Logdatei.
+   * @param {string} eintrag - Text
+   */
+  this._schreibeEintrag = async function (eintrag) {
+    if (!this.aktiviert || !this.logFile) return;
+    const zeitstempel = new Date().toTimeString().substr(0, 8);
+    const line = `${zeitstempel} - ${eintrag}` + EOL;
+    const exists = await this.logFile.exists();
+    if (!exists) {
+      await this.logFile.write((MIT_BOM ? UTF8_BOM : "") + line, { append: false });
+      return;
+    }
+    await this.logFile.write(line, { append: true });
+  };
+}
+
+/**
+ * Dateioperationen und Fallback-Suche.
+ * @param {{logger:Logger}} dependencies - Abhängigkeiten
+ * @constructor
+ */
+function FileService(dependencies) {
+  this.logger = dependencies.logger;
+
+  /**
+   * Sucht eine Datei relativ zum Originalpfad; nutzt Fallbackwurzel, wenn freigegeben.
+   * @param {string} originalPfad - Pfadstring
+   * @returns {Promise<any|null>} File-Handle oder null
+   */
+  this.findeDateiMitFallback = async function (originalPfad) {
+    const name = originalPfad.split("/").pop();
+    const wurzel = await localFileSystem.getFolder();
+    if (!wurzel) {
+      await this.logger.logWarnung("Kein Wurzelordner ausgewählt.");
+      return null;
+    }
+    const treffer = [];
+    await this._sucheRekursiv(wurzel, name, treffer, FALLBACK_SUCHTIEFE, 0);
+    if (treffer.length === 0) {
+      await this.logger.logWarnung("Datei nicht gefunden: " + name);
+      return null;
+    }
+    treffer.sort((a, b) => b.modificationTime - a.modificationTime);
+    await this.logger.log("Verwende Treffer: " + treffer[0].name);
+    return treffer[0];
+  };
+
+  /**
+   * Rekursive Suche mit Tiefenlimit.
+   * @param {any} ordner - Ordnerhandle
+   * @param {string} dateiName - Dateiname
+   * @param {any[]} alleTreffer - Trefferliste
+   * @param {number} maxTiefe - Max. Tiefe
+   * @param {number} aktuelleTiefe - Laufende Tiefe
+   */
+  this._sucheRekursiv = async function (ordner, dateiName, alleTreffer, maxTiefe, aktuelleTiefe) {
+    if (aktuelleTiefe >= maxTiefe) return;
+    const entries = await ordner.getEntries();
+    for (let i = 0; i < entries.length; i++) {
+      const e = entries[i];
+      if (e.isFile && e.name.toLowerCase() === dateiName.toLowerCase()) {
+        alleTreffer.push(e);
+      } else if (e.isFolder) {
+        await this._sucheRekursiv(e, dateiName, alleTreffer, maxTiefe, aktuelleTiefe + 1);
+      }
+    }
+  };
+
+  /**
+   * Liefert den Basisnamen ohne Erweiterung.
+   * @param {string} dateiName - Name
+   * @returns {string}
+   */
+  this.holeBasisname = function (dateiName) {
+    const letzterpunkt = dateiName.lastIndexOf(".");
+    return letzterpunkt === -1 ? dateiName : dateiName.substring(0, letzterpunkt);
+  };
+}
+
+/**
+ * Dokumentdienste für Öffnen/Schließen und Layer.
+ * @param {{logger:Logger, errorHandler:ErrorHandler}} dependencies - Abhängigkeiten
+ * @constructor
+ */
+function DocumentService(dependencies) {
+  this.logger = dependencies.logger;
+  this.errorHandler = dependencies.errorHandler;
+
+  /**
+   * Öffnet ein Dokument.
+   * @param {any} fileHandle - UXP File-Handle
+   * @param {boolean} userInteraction - Flag (wird ignoriert)
+   * @returns {Promise<any>}
+   */
+  this.oeffneDokument = async function (fileHandle, userInteraction) {
+    try {
+      await this.logger.log("Öffne Dokument: " + fileHandle.name);
+      const doc = await app.open(fileHandle);
+      return doc;
+    } catch (fehler) {
+      const fehlermeldung = this.errorHandler.formatiereFehler(fehler, fileHandle.name);
+      await this.logger.logFehler("Fehler beim Öffnen: " + fehlermeldung, fileHandle.name);
+      throw new Error("Fehler beim Öffnen: " + fehlermeldung);
+    }
+  };
+
+  /**
+   * Schließt ein Dokument ohne zu sichern.
+   * @param {any} doc - Dokument
+   */
+  this.schliesseDokument = async function (doc) {
+    try {
+      if (doc && doc.isValid) {
+        await this.logger.log("Schließe Dokument: " + doc.name);
+        await doc.close();
+      }
+    } catch (fehler) {
+      await this.logger.logWarnung("Fehler beim Schließen des Dokuments: " + fehler.message);
+    }
+  };
+
+  /**
+   * Liest alle Layernamen.
+   * @param {any} doc - Dokument
+   * @returns {string[]}
+   */
+  this.holeAlleLayer = function (doc) {
+    const namen = [];
+    for (let i = 0; i < doc.layers.length; i++) {
+      namen.push(doc.layers[i].name);
+    }
+    return namen;
+  };
+}
+
+/**
+ * CSV-Schreiben.
+ * @param {{logger:Logger}} dependencies - Abhängigkeiten
+ * @constructor
+ */
+function CsvService(dependencies) {
+  this.logger = dependencies.logger;
+
+  /**
+   * Schreibt eine CSV-Datei aus mehreren Datensätzen.
+   * @param {Array} datenArray - Datensätze mit header/zeilen
+   * @param {any} csvFileHandle - UXP File-Handle
+   * @returns {Promise<any>}
+   */
+  this.schreibeEinzelneCsv = async function (datenArray, csvFileHandle) {
+    await this.logger.log("Erstelle CSV-Datei: " + csvFileHandle.name);
+    let inhalt = datenArray.length > 0 ? datenArray[0].header : "";
+    for (let i = 0; i < datenArray.length; i++) {
+      if (datenArray[i] && datenArray[i].zeilen) {
+        inhalt += datenArray[i].zeilen;
+      }
+    }
+    // Deduplizierung beibehalten, um die bestehende Ausgabe zu spiegeln
+    inhalt = this._entferneDuplikate(inhalt);
+    // Abschlusszeile wie im Original
+    if (!inhalt.endsWith(EOL)) inhalt += EOL;
+    const finalerText = (MIT_BOM ? UTF8_BOM : "") + inhalt;
+    await csvFileHandle.write(finalerText, { append: false });
+    await this.logger.log("CSV-Datei erfolgreich erstellt: " + csvFileHandle.name);
+    return csvFileHandle;
+  };
+
+  /**
+   * Entfernt doppelte Zeilen.
+   * @param {string} inhalt - Text
+   * @returns {string}
+   */
+  this._entferneDuplikate = function (inhalt) {
+    const zeilen = inhalt.split(/\r?\n/);
+    const seen = Object.create(null);
+    const out = [];
+    for (let i = 0; i < zeilen.length; i++) {
+      const z = zeilen[i];
+      if (z.length === 0) continue;
+      if (!Object.prototype.hasOwnProperty.call(seen, z)) {
+        seen[z] = true;
+        out.push(z);
+      }
+    }
+    return out.join(EOL);
+  };
+}
+
+/**
+ * Datenextraktion aus Dokumenten (Grafiken, Text, Tabellen, PageItems).
+ * @param {{logger:Logger}} dependencies - Abhängigkeiten
+ * @constructor
+ */
+function DataProcessors(dependencies) {
+  this.logger = dependencies.logger;
+
+  /**
+   * Extrahiert Grafikzeilen.
+   * @param {any} currentPage - Zielseite im Quelldokument
+   * @param {any} page - Seite im Hauptdokument
+   * @param {any} settings - Einstellungen
+   * @returns {string}
+   */
+  this.verarbeiteGraphics = function (currentPage, page, settings) {
+    let temp = "";
+    if (!currentPage) return temp;
+    for (let j = 0; j < currentPage.allPageItems.length; j++) {
+      const pageItem = currentPage.allPageItems[j];
+      for (let i = 0; i < pageItem.allGraphics.length; i++) {
+        const graphic = pageItem.allGraphics[i];
+        if (graphic && graphic.itemLink && graphic.itemLink.name && graphic.visibleBounds) {
+          const parentObject = graphic.parent;
+          const graphicFileName = ("" + graphic.itemLink.name).replace(/,/g, "_");
+          if (page && !isNaN(page.name) && page.name > 0) {
+            if (settings.pages) settings.pages.push(page.name);
+            let line = `${CSV_ZEILE_GRAPHIC},${page.name},${page.index},${graphicFileName},${graphic.visibleBounds}`;
+            line = concatTempWithShapes(parentObject, line);
+            temp += line + EOL;
+          }
+        }
+      }
+    }
+    return temp;
+  };
+
+  /**
+   * Extrahiert Text aus TextFrames.
+   * @param {any} currentPage - Seite
+   * @param {any} page - Hauptdokumentseite
+   * @param {any} settings - Einstellungen
+   * @returns {string}
+   */
+  this.verarbeiteTextFrames = function (currentPage, page, settings) {
+    let temp = "";
+    for (let i = 0; i < currentPage.allPageItems.length; i++) {
+      const pageItem = currentPage.allPageItems[i];
+      if (pageItem instanceof TextFrame) {
+        if (page) {
+          temp = this._verarbeiteZeilen(pageItem.lines, temp, page.name, settings.regex.textFrame, CSV_ZEILE_TEXT, settings);
+        }
+      }
+    }
+    return temp;
+  };
+
+  /**
+   * Extrahiert Text aus Stories.
+   * @param {any} doc - Dokument
+   * @param {any} currentPage - Seite
+   * @param {any} page - Hauptdokumentseite
+   * @param {any} settings - Einstellungen
+   * @returns {string}
+   */
+  this.verarbeiteStories = function (doc, currentPage, page, settings) {
+    let temp = "";
+    for (let i = 0; i < doc.stories.length; i++) {
+      const currentStory = doc.stories.item(i);
+      for (let j = 0; j < currentStory.textFrames.length; j++) {
+        const currentTextFrame = currentStory.textFrames.item(j);
+        if (currentTextFrame.parentPage && currentTextFrame.parentPage.name == currentPage.name) {
+          if (page) {
+            temp = this._verarbeiteZeilen(currentTextFrame.lines, temp, page.name, settings.regex.textFrame, CSV_ZEILE_TEXT, settings);
+          }
+        }
+      }
+    }
+    return temp;
+  };
+
+  /**
+   * Extrahiert Text aus Tabellen.
+   * @param {any} doc - Dokument
+   * @param {any} currentPage - Seite
+   * @param {any} page - Hauptdokumentseite
+   * @param {any} settings - Einstellungen
+   * @returns {string}
+   */
+  this.verarbeiteTables = function (doc, currentPage, page, settings) {
+    let temp = "";
+    for (let i = 0; i < doc.stories.length; i++) {
+      const currentStory = doc.stories.item(i);
+      for (let j = 0; j < currentStory.textFrames.length; j++) {
+        const currentTextFrame = currentStory.textFrames.item(j);
+        if (currentTextFrame.parentPage && currentTextFrame.parentPage.name == currentPage.name) {
+          for (let k = 0; k < currentTextFrame.tables.length; k++) {
+            const table = currentTextFrame.tables.item(k);
+            if (page) {
+              temp = this._verarbeiteTabelle(table, temp, page.name, settings.regex.table, settings);
+            }
+          }
+        }
+      }
+    }
+    return temp;
+  };
+
+  /**
+   * Verarbeitet Tabellenzellen.
+   * @param {any} table - Tabelle
+   * @param {string} temp - Akkumulator
+   * @param {string|number} pageName - Seitenname
+   * @param {RegExp} regex - Filter
+   * @param {any} settings - Einstellungen
+   * @returns {string}
+   */
+  this._verarbeiteTabelle = function (table, temp, pageName, regex, settings) {
+    for (let i = 0; i < table.cells.length; i++) {
+      const cell = table.cells.item(i);
+      if (cell.textStyleRanges.length > 0) {
+        temp = this._verarbeiteZeilen(cell.textStyleRanges.item(0).lines, temp, pageName, regex, CSV_ZEILE_TEXT, settings);
+      }
+    }
+    return temp;
+  };
+
+  /**
+   * Extrahiert PageItems mit Label.
+   * @param {any} currentPage - Seite
+   * @param {any} page - Hauptdokumentseite
+   * @param {any} settings - Einstellungen
+   * @returns {string}
+   */
+  this.verarbeitePageItems = function (currentPage, page, settings) {
+    let temp = "";
+    for (let i = 0; i < currentPage.allPageItems.length; i++) {
+      const pageItem = currentPage.allPageItems[i];
+      if (pageItem.label !== "") {
+        const visibleBounds = pageItem.visibleBounds;
+        const linkType = pageItem.allGraphics.length === 1 && pageItem.allGraphics[0].itemLink
+          ? pageItem.allGraphics[0].itemLink.name
+          : "unknown";
+        if (page && !isNaN(page.name) && page.name > 0) {
+          if (settings.pages) settings.pages.push(page.name);
+          let line = `${CSV_ZEILE_PAGEITEM},${page.name},"${("" + linkType).replace(/,/g, "_")}","${("" + pageItem.label).replace(/,/g, "_")}",${visibleBounds}`;
+          line = concatTempWithPageItems(pageItem.parent, line);
+          temp += line + EOL;
+        }
+      }
+    }
+    return temp;
+  };
+
+  /**
+   * Extrahiert Zeilen aus einem Line-Array.
+   * @param {any} lines - Zeilenliste
+   * @param {string} temp - Akkumulator
+   * @param {string|number} pageName - Seite
+   * @param {RegExp} regex - Filter
+   * @param {string} letter - Zeilentyp
+   * @param {any} settings - Einstellungen
+   * @returns {string}
+   */
+  this._verarbeiteZeilen = function (lines, temp, pageName, regex, letter, settings) {
+    for (let i = 0; i < lines.length; i++) {
+      try {
+        const line = lines.item(i);
+        const lineContents = "" + line.contents;
+        const characters = line.characters;
+        const result = regex.exec(lineContents);
+        if (result === undefined || result === null) {
+          continue;
+        }
+        const artNr = result[0];
+        if (settings.pages) settings.pages.push(pageName);
+        const xLeft = characters[0].horizontalOffset;
+        const yTop = characters[0].baseline - line.ascent - line.descent;
+        const yBottom = characters[0].baseline;
+        const xRight = characters[characters.length - 1].horizontalOffset;
+        temp += `${letter},${pageName},${artNr},${yTop},${xLeft},${yBottom},${xRight}` + EOL;
+      } catch (e) {
+        // bewusst leer
+      }
+    }
+    return temp;
+  };
+
+  /**
+   * Ermittelt die Zielseite im Quelldokument.
+   * @param {ReturnType<typeof erstelleExportItem>} sourceItem - Export-Item
+   * @param {any} inddDoc - Quelldokument
+   * @returns {number} 1-basierte Seitennummer
+   */
+  this.ermittleZielseite = function (sourceItem, inddDoc) {
+    try {
+      if (inddDoc.pages.length === 1) return 1;
+      try {
+        if (
+          sourceItem.typ === EXPORT_MODE_CONVERT &&
+          sourceItem.link &&
+          sourceItem.link.parent &&
+          Object.prototype.hasOwnProperty.call(sourceItem.link.parent, "pdfAttributes") &&
+          sourceItem.link.parent.pdfAttributes
+        ) {
+          const pdfNum = sourceItem.link.parent.pdfAttributes.pageNumber;
+          if (pdfNum >= 1 && pdfNum <= inddDoc.pages.length) {
+            return pdfNum;
+          }
+        }
+      } catch (ePdf) { /* bewusst leer */ }
+      const linkParent = sourceItem.link ? sourceItem.link.parent : null;
+      if (linkParent && Object.prototype.hasOwnProperty.call(linkParent, "pageNumber")) {
+        const pageNum = linkParent.pageNumber;
+        if (pageNum >= 1 && pageNum <= inddDoc.pages.length) {
+          return pageNum;
+        }
+      }
+      if (sourceItem.typ === EXPORT_MODE_CONVERT && inddDoc.pages.length === 4) {
+        const isRight = sourceItem.page.side === PageSideOptions.RIGHT_HAND;
+        return isRight ? FOUR_PAGE_SIDE_MAP.RIGHT : FOUR_PAGE_SIDE_MAP.LEFT;
+      }
+      if (sourceItem.typ === EXPORT_MODE_CONVERT && inddDoc.pages.length === 2) {
+        const isRight2 = sourceItem.page.side === PageSideOptions.RIGHT_HAND;
+        return isRight2 ? 2 : 1;
+      }
+    } catch (e) {
+      // bewusst Standardrückfall
+    }
+    return 1;
+  };
+
+  /**
+   * Verarbeitet ein geöffnetes Quelldokument.
+   * @param {any} inddDoc - Quelldokument
+   * @param {any} settings - Einstellungen
+   * @param {ReturnType<typeof erstelleExportItem>} sourceItem - Export-Item
+   * @returns {any}
+   */
+  this.verarbeiteDokument = function (inddDoc, settings, sourceItem) {
+    const hauptDokPage = sourceItem.page;
+    const pageNumber = this.ermittleZielseite(sourceItem, inddDoc);
+    if (isNaN(pageNumber) || pageNumber < 1 || pageNumber > inddDoc.pages.length) {
+      throw new Error("Ungültige Seitennummer: " + pageNumber + " in Dokument: " + inddDoc.name);
+    }
+    const targetPage = inddDoc.pages[pageNumber - 1];
+    let daten = "";
+    if (settings.exportOptionen.graphics) {
+      daten += this.verarbeiteGraphics(targetPage, hauptDokPage, settings);
+    }
+    if (settings.exportOptionen.textInStories) {
+      daten += this.verarbeiteStories(inddDoc, targetPage, hauptDokPage, settings);
+    }
+    if (settings.exportOptionen.textFrames) {
+      daten += this.verarbeiteTextFrames(targetPage, hauptDokPage, settings);
+    }
+    if (settings.exportOptionen.tables) {
+      daten += this.verarbeiteTables(inddDoc, targetPage, hauptDokPage, settings);
+    }
+    if (settings.exportOptionen.pageItems) {
+      daten += this.verarbeitePageItems(targetPage, hauptDokPage, settings);
+    }
+    return erstelleCsvDataModel(inddDoc, sourceItem, daten, settings.layer.name);
+  };
+}
+
+/**
+ * UI-Fabrik: Hier lieferst du Werte in UXP-UI; Platzhalter für Programmfluss.
+ * @constructor
+ */
+function DialogFactory() {
+  /**
+   * Fragt Einstellungen für CSV-Export ab.
+   * @param {string[]} layerNamen - Auswahl
+   * @param {string} standardOrdnerName - Anzeigename
+   * @returns {Promise<{layerName:string|null,zielOrdner:any,alleEbenen:boolean}|null>}
+   */
+  this.erstelleCsvExportEinstellungenDialog = async function (layerNamen, standardOrdnerName) {
+    const zielOrdner = await localFileSystem.getFolder();
+    if (!zielOrdner) return null;
+    const layerName = layerNamen && layerNamen.length > 0 ? layerNamen[0] : null;
+    return { layerName, zielOrdner, alleEbenen: false };
+  };
+
+  /**
+   * Fragt, ob Abschnittsnummerierung korrigiert werden soll.
+   * @returns {Promise<boolean>}
+   */
+  this.erstelleAbschnittsOptionenDialog = async function () {
+    return true;
+  };
+
+  /**
+   * Erstellt eine Fortschritts-Schnittstelle.
+   * @param {string} nachricht - Starttext
+   * @param {DateUtils} dateiUtils - Zeitformatierer
+   * @returns {{isCancelled:()=>boolean,update:(current:number,max:number,msg?:string)=>void,close:()=>void}}
+   */
+  this.erstelleFortschrittsDialog = function (nachricht, dateiUtils) {
+    let abgebrochen = false;
+    const startTime = new Date();
+    return {
+      isCancelled: function () { return abgebrochen; },
+      update: function (current, max, msg) { /* bewusst minimal */ },
+      close: function () { /* bewusst minimal */ },
+    };
+  };
+}
+
+/**
+ * Koordiniert den Export über mehrere Items.
+ * @param {{documentService:DocumentService,dataProcessors:DataProcessors,dialogFactory:DialogFactory,logger:Logger,errorHandler:ErrorHandler,dateUtils:DateUtils,fileService:FileService}} dependencies - Abhängigkeiten
+ * @constructor
+ */
+function ExportCoordinator(dependencies) {
+  this.documentService = dependencies.documentService;
+  this.dataProcessors = dependencies.dataProcessors;
+  this.dialogFactory = dependencies.dialogFactory;
+  this.logger = dependencies.logger;
+  this.errorHandler = dependencies.errorHandler;
+  this.dateUtils = dependencies.dateUtils;
+  this.fileService = dependencies.fileService;
+
+  /**
+   * Führt den Export über alle Items aus.
+   * @param {Array<ReturnType<typeof erstelleExportItem>>} exportItems - Items
+   * @param {any} settings - Einstellungen
+   * @returns {Promise<{daten:any[],fehler:any[]}>}
+   */
+  this.koordiniereExport = async function (exportItems, settings) {
+    await this.logger.log("Starte Export-Koordination: " + exportItems.length + " Items");
+    const progressDialog = this.dialogFactory.erstelleFortschrittsDialog("INDD Dateien werden verarbeitet...", this.dateUtils);
+    const alleDaten = [];
+    const fehlerListe = [];
+    try {
+      for (let i = 0; i < exportItems.length; i++) {
+        if (progressDialog.isCancelled()) {
+          await this.logger.log("Export wurde vom Benutzer abgebrochen");
+          break;
+        }
+        const item = exportItems[i];
+        const dateiName = item.inddDatei ? item.inddDatei.name : (item.pdfName || "unbekannt");
+        progressDialog.update(i + 1, exportItems.length, "Verarbeite: " + dateiName + " (" + (i + 1) + "/" + exportItems.length + ")");
+        try {
+          const csvData = await this._verarbeiteItem(item, settings);
+          if (csvData) alleDaten.push(csvData);
+        } catch (fehler) {
+          this.errorHandler.sammleFehler(fehler, dateiName, fehlerListe);
+        }
+      }
+    } finally {
+      progressDialog.close();
+    }
+    return { daten: alleDaten, fehler: fehlerListe };
+  };
+
+  /**
+   * Verarbeitet ein Item: öffnet ggf. INDD, extrahiert Daten, schließt Dokument.
+   * @param {ReturnType<typeof erstelleExportItem>} item - Item
+   * @param {any} settings - Einstellungen
+   * @returns {Promise<any>}
+   */
+  this._verarbeiteItem = async function (item, settings) {
+    let inddDatei = item.inddDatei;
+    if (item.typ === EXPORT_MODE_CONVERT) {
+      const basisName = this.fileService.holeBasisname(item.pdfName);
+      inddDatei = await this.fileService.findeDateiMitFallback(basisName + ".indd");
+      item.inddDatei = inddDatei;
+    }
+    if (!inddDatei) {
+      throw new Error("INDD-Datei nicht gefunden für: " + (item.pdfName || ""));
+    }
+    let doc = null;
+    try {
+      doc = await this.documentService.oeffneDokument(inddDatei, false);
+      return this.dataProcessors.verarbeiteDokument(doc, settings, item);
+    } finally {
+      if (doc) await this.documentService.schliesseDokument(doc);
+    }
+  };
+}
+
+/**
+ * Orchestriert den CSV-Export-Workflow.
+ * @param {{exportCoordinator:ExportCoordinator,csvService:CsvService,dialogFactory:DialogFactory,logger:Logger,documentService:DocumentService,errorHandler:ErrorHandler}} dependencies - Abhängigkeiten
+ * @constructor
+ */
+function CsvExportWorkflow(dependencies) {
+  this.exportCoordinator = dependencies.exportCoordinator;
+  this.csvService = dependencies.csvService;
+  this.dialogFactory = dependencies.dialogFactory;
+  this.logger = dependencies.logger;
+  this.documentService = dependencies.documentService;
+  this.errorHandler = dependencies.errorHandler;
+  this.pages = [];
+
+  /**
+   * Führt den Workflow aus.
+   * @returns {Promise<void>}
+   */
+  this.fuehreAus = async function () {
+    await this.logger.log("Starte CSV-Export-Workflow");
+    const doc = app.activeDocument;
+    const layerNamen = this.documentService.holeAlleLayer(doc);
+    if (layerNamen.length === 0) {
+      return;
+    }
+    let einstellungen = null;
+    let prozessFortsetzen = false;
+    while (!prozessFortsetzen) {
+      einstellungen = await this.dialogFactory.erstelleCsvExportEinstellungenDialog(layerNamen, doc.name);
+      if (!einstellungen) return;
+      if (einstellungen.alleEbenen) {
+        prozessFortsetzen = true;
+      } else {
+        prozessFortsetzen = true;
+      }
+    }
+    const linksAufEbene = this._bestimmeLinksInDokument(doc, einstellungen.alleEbenen ? null : einstellungen.layerName);
+    if (linksAufEbene.length === 0) {
+      return;
+    }
+    const exportItems = this._erstelleExportItemsAusLinks(linksAufEbene);
+    if (exportItems.length === 0) {
+      return;
+    }
+    const settings = this._erstelleStandardSettings();
+    settings.layer.name = einstellungen.alleEbenen ? "Alle Ebenen" : einstellungen.layerName;
+    const ergebnis = await this.exportCoordinator.koordiniereExport(exportItems, settings);
+    if (ergebnis.daten.length > 0) {
+      const csvDatei = await this._erstelleCsvDateiHandle(einstellungen.zielOrdner, doc);
+      await this.csvService.schreibeEinzelneCsv(ergebnis.daten, csvDatei);
+    }
+  };
+
+  /**
+   * Sammelt Links im Dokument, optional auf Layer eingeschränkt.
+   * @param {any} doc - Dokument
+   * @param {string|null} layerName - Layer
+   * @returns {Array<{itemLink:any,page:any}>}
+   */
+  this._bestimmeLinksInDokument = function (doc, layerName) {
+    const linksImDokument = [];
+    const zielLayer = layerName ? doc.layers.itemByName(layerName) : null;
+    for (let p = 0; p < doc.pages.length; p++) {
+      const currentPage = doc.pages[p];
+      for (let k = 0; k < currentPage.allPageItems.length; k++) {
+        const currentPageItem = currentPage.allPageItems[k];
+        const ebeneOk = !zielLayer || currentPageItem.itemLayer === zielLayer;
+        if (currentPageItem instanceof Rectangle && Object.prototype.hasOwnProperty.call(currentPageItem, "importedPages")) {
+          for (let j = 0; j < currentPageItem.importedPages.length; j++) {
+            const importedPage = currentPageItem.importedPages[j];
+            try {
+              const link = importedPage.itemLink;
+              if (!link) continue;
+              const nameLower = ("" + link.name).toLowerCase();
+              if (nameLower.indexOf(".indd") === -1 && nameLower.indexOf(".pdf") === -1) continue;
+              if (!zielLayer || importedPage.itemLayer === zielLayer) {
+                linksImDokument.push({ itemLink: link, page: currentPage });
+              }
+            } catch (e) { /* bewusst leer */ }
+          }
+        }
+        if (currentPageItem.allGraphics && currentPageItem.allGraphics.length > 0) {
+          for (let g = 0; g < currentPageItem.allGraphics.length; g++) {
+            try {
+              const graphic = currentPageItem.allGraphics[g];
+              const gLink = graphic && graphic.itemLink ? graphic.itemLink : null;
+              if (!gLink) continue;
+              const gNameLower = ("" + gLink.name).toLowerCase();
+              if (gNameLower.indexOf(".indd") === -1 && gNameLower.indexOf(".pdf") === -1) continue;
+              if (ebeneOk) {
+                linksImDokument.push({ itemLink: gLink, page: currentPage });
+              }
+            } catch (e2) { /* bewusst leer */ }
+          }
+        }
+      }
+    }
+    return linksImDokument;
+  };
+
+  /**
+   * Erstellt ExportItems aus Links.
+   * @param {Array<{itemLink:any,page:any}>} links - Links
+   * @returns {Array<ReturnType<typeof erstelleExportItem>>}
+   */
+  this._erstelleExportItemsAusLinks = function (links) {
+    const items = [];
+    for (let i = 0; i < links.length; i++) {
+      const linkInfo = links[i];
+      const linkNameLower = ("" + linkInfo.itemLink.name).toLowerCase();
+      const typ = linkNameLower.indexOf(".indd") > -1 ? EXPORT_MODE_DIRECT : EXPORT_MODE_CONVERT;
+      let inddDatei = null;
+      let pdfName = null;
+      if (typ === EXPORT_MODE_DIRECT) {
+        inddDatei = linkInfo.itemLink.fileHandle || null;
+      } else {
+        pdfName = linkInfo.itemLink.name;
+      }
+      items.push(erstelleExportItem(typ, inddDatei, pdfName, linkInfo.page, linkInfo.itemLink));
+    }
+    return items;
+  };
+
+  /**
+   * Erstellt Standard-Einstellungen.
+   * @returns {any}
+   */
+  this._erstelleStandardSettings = function () {
+    return {
+      layer: { name: "" },
+      exportOptionen: {
+        graphics: STANDARD_EXPORT_GRAPHICS,
+        textFrames: STANDARD_EXPORT_TEXTFRAMES,
+        textInStories: STANDARD_EXPORT_TEXT_IN_STORIES,
+        tables: STANDARD_EXPORT_TABLES,
+        pageItems: STANDARD_EXPORT_PAGEITEMS,
+      },
+      regex: { textFrame: REGEX_TEXTFRAME_IN_STORY, table: REGEX_TABLE_IN_STORY },
+      pages: this.pages,
+    };
+  };
+
+  /**
+   * Erzeugt ein UXP-File-Handle für die CSV-Ausgabe mit identischem Dateinamenmuster.
+   * @param {any} ordnerHandle - Zielordner
+   * @param {any} doc - Dokument
+   * @returns {Promise<any>}
+   */
+  this._erstelleCsvDateiHandle = async function (ordnerHandle, doc) {
+    this.pages.sort((a, b) => parseInt(a) - parseInt(b));
+    let dateiName;
+    if (KEEP_CSV_NAMES) {
+      dateiName = doc.name + ".csv";
+    } else {
+      if (this.pages.length === 0) {
+        dateiName = `${CUSTOMER}_${doc.name.replace(/\.indd$/i, "")}_no_pages_found.csv`;
+      } else {
+        const erstePage = this.pages[0];
+        const letztePage = this.pages[this.pages.length - 1];
+        dateiName = `${CUSTOMER}_${erstePage}-${letztePage}.csv`;
+      }
+    }
+    const file = await ordnerHandle.createFile(dateiName, { overwrite: true });
+    return file;
+  };
+}
+
+/**
+ * Hauptcontroller für den Standalone-Export.
+ * @param {{csvExportWorkflow:CsvExportWorkflow,logger:Logger,errorHandler:ErrorHandler,dialogFactory:DialogFactory}} dependencies - Abhängigkeiten
+ * @constructor
+ */
+function CsvExportManager(dependencies) {
+  this.csvExportWorkflow = dependencies.csvExportWorkflow;
+  this.logger = dependencies.logger;
+  this.errorHandler = dependencies.errorHandler;
+  this.dialogFactory = dependencies.dialogFactory;
+
+  /**
+   * Startet den Export.
+   * @returns {Promise<void>}
+   */
+  this.starte = async function () {
+    const ok = await this._initialisiere();
+    if (!ok) return;
+    try {
+      await this.csvExportWorkflow.fuehreAus();
+    } catch (fehler) {
+      const fehlerMsg = this.errorHandler.formatiereFehler(fehler, "CsvExportManager");
+      await this.logger.logFehler(fehlerMsg, "CsvExportManager.starte");
+    } finally {
+      await this.logger.log("=== Script beendet ===");
+    }
+  };
+
+  /**
+   * Korrigiert Abschnittsnummerierung, wenn nötig.
+   * @param {any} doc - Dokument
+   */
+  this.korrigiereAbschnitte = async function (doc) {
+    await this.logger.logWarnung("Korrigiere Abschnittsoptionen für das Dokument.");
+    for (let i = 1; i < doc.pages.length; i++) {
+      const page = doc.pages[i];
+      if (page.name === "1") {
+        try {
+          page.appliedSection.continueNumbering = true;
+          await this.logger.log("Abschnittsanfang auf Dokumentseite " + (i + 1) + " wurde korrigiert.");
+        } catch (e) {
+          await this.logger.logFehler("Fehler bei der Korrektur von Seite " + (i + 1) + ": " + e.message);
+        }
+      }
+    }
+  };
+
+  /**
+   * Initialisiert Umgebung, Logdatei, prüft Dokument und Abschnitte.
+   * @returns {Promise<boolean>}
+   */
+  this._initialisiere = async function () {
+    if (app.documents.length === 0) {
+      return false;
+    }
+    const doc = app.activeDocument;
+    if (!doc.saved || !doc.filePath) {
+      return false;
+    }
+    let pageOneCount = 0;
+    for (let i = 0; i < doc.pages.length; i++) {
+      if (doc.pages[i].name === "1") pageOneCount++;
+    }
+    if (pageOneCount > 1) {
+      const korrigieren = await this.dialogFactory.erstelleAbschnittsOptionenDialog();
+      if (korrigieren) {
+        await this.korrigiereAbschnitte(doc);
+      } else {
+        await this.logger.logWarnung("Prozess wegen Abschnittsoptionen abgebrochen.");
+        return false;
+      }
+    }
+    if (LOGGING_AKTIVIERT) {
+      const ordner = await localFileSystem.getFolder();
+      const logDatei = await ordner.createFile(doc.name.replace(/\.indd$/i, "") + "_Umsetz_log.txt", { overwrite: true });
+      this.logger.initialisiere(logDatei, true);
+    }
+    await this.logger.log("=== " + SKRIPT_NAME + " " + SKRIPT_VERSION + " ===");
+    await this.logger.log("Dokument: " + doc.name);
+    return true;
+  };
+}
+
+/**
+ * Erstellt den Dependency-Container und startet den Manager.
+ * @returns {Promise<void>}
+ */
+async function main() {
+  function erstelleDependencyContainer() {
+    const container = {};
+    container.errorHandler = new ErrorHandler();
+    container.logger = new Logger();
+    container.dateUtils = new DateUtils();
+    container.stringUtils = new StringUtils();
+    container.fileService = new FileService({ logger: container.logger });
+    container.documentService = new DocumentService({ logger: container.logger, errorHandler: container.errorHandler });
+    container.csvService = new CsvService({ logger: container.logger });
+    container.dataProcessors = new DataProcessors({ logger: container.logger });
+    container.dialogFactory = new DialogFactory();
+    container.exportCoordinator = new ExportCoordinator({
+      documentService: container.documentService,
+      dataProcessors: container.dataProcessors,
+      dialogFactory: container.dialogFactory,
+      logger: container.logger,
+      errorHandler: container.errorHandler,
+      dateUtils: container.dateUtils,
+      fileService: container.fileService,
+    });
+    container.csvExportWorkflow = new CsvExportWorkflow({
+      exportCoordinator: container.exportCoordinator,
+      csvService: container.csvService,
+      dialogFactory: container.dialogFactory,
+      logger: container.logger,
+      documentService: container.documentService,
+      errorHandler: container.errorHandler,
+    });
+    container.csvExportManager = new CsvExportManager({
+      csvExportWorkflow: container.csvExportWorkflow,
+      logger: container.logger,
+      errorHandler: container.errorHandler,
+      dialogFactory: container.dialogFactory,
+    });
+    return container;
+  }
+
+  const container = erstelleDependencyContainer();
+  await container.csvExportManager.starte();
+}
+
+// Starte Hauptlogik
+main().catch(async (e) => {
+  try {
+    const ordner = await localFileSystem.getFolder();
+    const crashLog = await ordner.createFile("UXP_Umsetz_Kritisch.txt", { overwrite: true });
+    await crashLog.write((MIT_BOM ? UTF8_BOM : "") + (e && e.message ? e.message : String(e)) + EOL, { append: false });
+  } catch (_) { /* bewusst leer */ }
+});
